@@ -64,6 +64,8 @@ typedef struct
 typedef struct
 {
 	bool	has_agg;
+	bool	has_subquery;
+	int		sublevels_up;
 } check_ivm_restriction_context;
 
 static void CreateIvmTriggersOnBaseTablesRecurse(Query *qry, Node *node, Oid matviewOid,
@@ -525,6 +527,12 @@ CreateIvmTriggersOnBaseTablesRecurse(Query *qry, Node *node, Oid matviewOid,
 
 					*relids = bms_add_member(*relids, rte->relid);
 				}
+				else if (rte->rtekind == RTE_SUBQUERY)
+				{
+					Query *subquery = rte->subquery;
+					Assert(rte->subquery != NULL);
+					CreateIvmTriggersOnBaseTablesRecurse(subquery, (Node *)subquery, matviewOid, relids, ex_lock);
+				}
 			}
 			break;
 
@@ -646,7 +654,7 @@ CreateIvmTrigger(Oid relOid, Oid viewOid, int16 type, int16 timing, bool ex_lock
 static void
 check_ivm_restriction(Node *node)
 {
-	check_ivm_restriction_context context = {false};
+	check_ivm_restriction_context context = {false, false};
 
 	check_ivm_restriction_walker(node, &context);
 }
@@ -713,10 +721,11 @@ check_ivm_restriction_walker(Node *node, check_ivm_restriction_context *context)
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							 errmsg("FOR UPDATE/SHARE clause is not supported on incrementally maintainable materialized view")));
-				if (qry->hasSubLinks)
+				if (qry->hasSubLinks && context->sublevels_up > 0)
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("subquery is not supported on incrementally maintainable materialized view")));
+							 errmsg("this query is not allowed on incrementally maintainable materialized view"),
+							 errhint("Only simple subquery is supported")));
 
 				/* system column restrictions */
 				vars = pull_vars_of_level((Node *) qry, 0);
@@ -732,6 +741,15 @@ check_ivm_restriction_walker(Node *node, check_ivm_restriction_context *context)
 									 errmsg("system column is not supported on incrementally maintainable materialized view")));
 					}
 				}
+				/* subquery restrictions */
+				if (context->sublevels_up > 0 && qry->distinctClause != NIL)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("DISTINCT clause in nested query are not supported on incrementally maintainable materialized view")));
+				if (context->sublevels_up > 0 && qry->hasAggs)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("aggregate functions in nested query are not supported on incrementally maintainable materialized view")));
 
 				context->has_agg |= qry->hasAggs;
 
@@ -776,10 +794,13 @@ check_ivm_restriction_walker(Node *node, check_ivm_restriction_context *context)
 								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 								 errmsg("VALUES is not supported on incrementally maintainable materialized view")));
 					if (rte->rtekind == RTE_SUBQUERY)
-						ereport(ERROR,
-								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-								 errmsg("subquery is not supported on incrementally maintainable materialized view")));
+					{
+						context->has_subquery = true;
 
+						context->sublevels_up++;
+						check_ivm_restriction_walker((Node *)rte->subquery, context);
+						context->sublevels_up--;
+					}
 				}
 
 				query_tree_walker(qry, check_ivm_restriction_walker, (void *) context, QTW_IGNORE_RANGE_TABLE);
@@ -797,6 +818,12 @@ check_ivm_restriction_walker(Node *node, check_ivm_restriction_context *context)
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							 errmsg("expression containing an aggregate in it is not supported on incrementally maintainable materialized view")));
+
+				if (IsA(tle->expr, SubLink))
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("this query is not allowed on incrementally maintainable materialized view"),
+							 errhint("subquery is not supported in targetlist")));
 
 				expression_tree_walker(node, check_ivm_restriction_walker, (void *) context);
 				break;
@@ -840,6 +867,15 @@ check_ivm_restriction_walker(Node *node, check_ivm_restriction_context *context)
 							 errmsg("aggregate function %s is not supported on incrementally maintainable materialized view", aggname)));
 				break;
 			}
+		case T_SubLink:
+			{
+				/* Now, EXISTS clause is supported only */
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("this query is not allowed on incrementally maintainable materialized view"),
+						 errhint("Only simple subquery is supported")));
+				break;
+			}
 		default:
 			expression_tree_walker(node, check_ivm_restriction_walker, (void *) context);
 			break;
@@ -881,6 +917,51 @@ check_aggregate_supports_ivm(Oid aggfnoid)
 		case F_AVG_FLOAT8:
 		case F_AVG_INTERVAL:
 
+		/* min */
+		case F_MIN_ANYARRAY:
+		case F_MIN_INT8:
+		case F_MIN_INT4:
+		case F_MIN_INT2:
+		case F_MIN_OID:
+		case F_MIN_FLOAT4:
+		case F_MIN_FLOAT8:
+		case F_MIN_DATE:
+		case F_MIN_TIME:
+		case F_MIN_TIMETZ:
+		case F_MIN_MONEY:
+		case F_MIN_TIMESTAMP:
+		case F_MIN_TIMESTAMPTZ:
+		case F_MIN_INTERVAL:
+		case F_MIN_TEXT:
+		case F_MIN_NUMERIC:
+		case F_MIN_BPCHAR:
+		case F_MIN_TID:
+		case F_MIN_ANYENUM:
+		case F_MIN_INET:
+		case F_MIN_PG_LSN:
+
+		/* max */
+		case F_MAX_ANYARRAY:
+		case F_MAX_INT8:
+		case F_MAX_INT4:
+		case F_MAX_INT2:
+		case F_MAX_OID:
+		case F_MAX_FLOAT4:
+		case F_MAX_FLOAT8:
+		case F_MAX_DATE:
+		case F_MAX_TIME:
+		case F_MAX_TIMETZ:
+		case F_MAX_MONEY:
+		case F_MAX_TIMESTAMP:
+		case F_MAX_TIMESTAMPTZ:
+		case F_MAX_INTERVAL:
+		case F_MAX_TEXT:
+		case F_MAX_NUMERIC:
+		case F_MAX_BPCHAR:
+		case F_MAX_TID:
+		case F_MAX_ANYENUM:
+		case F_MAX_INET:
+		case F_MAX_PG_LSN:
 			return true;
 
 		default:
@@ -911,6 +992,52 @@ check_aggregate_supports_ivm(Oid aggfnoid)
 		"avg(float4)",
 		"avg(float8)",
 		"avg(interval)",
+
+		/* min */
+		"min(anyarray)",
+		"min(int8)",
+		"min(int4)",
+		"min(int2)",
+		"min(oid)",
+		"min(float4)",
+		"min(float8)",
+		"min(date)",
+		"min(time without time zone)",
+		"min(time with time zone)",
+		"min(money)",
+		"min(timestamp without time zone)",
+		"min(timestamp with time zone)",
+		"min(interval)",
+		"min(text)",
+		"min(numeric)",
+		"min(character)",
+		"min(tid)",
+		"min(anyenum)",
+		"min(inet)",
+		"min(pg_lsn)",
+
+		/* max */
+		"max(anyarray)",
+		"max(int8)",
+		"max(int4)",
+		"max(int2)",
+		"max(oid)",
+		"max(float4)",
+		"max(float8)",
+		"max(date)",
+		"max(time without time zone)",
+		"max(time with time zone)",
+		"max(money)",
+		"max(timestamp without time zone)",
+		"max(timestamp with time zone)",
+		"max(interval)",
+		"max(text)",
+		"max(numeric)",
+		"max(character)",
+		"max(tid)",
+		"max(anyenum)",
+		"max(inet)",
+		"max(pg_lsn)",
 
 		NULL
 	};
@@ -948,6 +1075,14 @@ CreateIndexOnIMMV(Query *query, Relation matviewRel, bool is_create)
 	char		idxname[NAMEDATALEN];
 	List	   *indexoidlist = RelationGetIndexList(matviewRel);
 	ListCell   *indexoidscan;
+
+
+	/*
+	 * For aggregate withoug GROUP BY, we do not need to create an index
+	 * because the view has only one row.
+	 */
+	if (query->hasAggs && query->groupClause == NIL)
+		return;
 
 	snprintf(idxname, sizeof(idxname), "%s_index", RelationGetRelationName(matviewRel));
 

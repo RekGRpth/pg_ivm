@@ -16,7 +16,6 @@ INSERT INTO mv_base_b VALUES
   (3,103),
   (4,104);
 
--- CREATE INCREMENTAL MATERIALIZED VIEW mv_ivm_1 AS SELECT i,j,k FROM mv_base_a a INNER JOIN mv_base_b b USING(i) WITH NO DATA;
 SELECT create_immv('mv_ivm_1', 'SELECT i,j,k FROM mv_base_a a INNER JOIN mv_base_b b USING(i)');
 SELECT * FROM mv_ivm_1 ORDER BY 1,2,3;
 
@@ -123,9 +122,33 @@ DELETE FROM mv_base_a WHERE (i,j) = (2,30);
 SELECT * FROM mv_ivm_avg_bug ORDER BY 1,2,3;
 ROLLBACK;
 
--- not support MIN(), MAX() aggregate functions
-SELECT create_immv('mv_ivm_min_max', 'SELECT i, MIN(j)  FROM mv_base_a GROUP BY i');
-SELECT create_immv('mv_ivm_min_max', 'SELECT i, MAX(j)  FROM mv_base_a GROUP BY i');
+-- support MIN(), MAX() aggregate functions
+BEGIN;
+SELECT create_immv('mv_ivm_min_max', 'SELECT i, MIN(j), MAX(j)  FROM mv_base_a GROUP BY i');
+SELECT * FROM mv_ivm_min_max ORDER BY 1,2,3;
+INSERT INTO mv_base_a VALUES
+  (1,11), (1,12),
+  (2,21), (2,22),
+  (3,31), (3,32),
+  (4,41), (4,42),
+  (5,51), (5,52);
+SELECT * FROM mv_ivm_min_max ORDER BY 1,2,3;
+DELETE FROM mv_base_a WHERE (i,j) IN ((1,10), (2,21), (3,32));
+SELECT * FROM mv_ivm_min_max ORDER BY 1,2,3;
+ROLLBACK;
+
+-- support MIN(), MAX() aggregate functions without GROUP clause
+BEGIN;
+SELECT create_immv('mv_ivm_min_max', 'SELECT MIN(j), MAX(j)  FROM mv_base_a');
+SELECT * FROM mv_ivm_min_max;
+INSERT INTO mv_base_a VALUES
+  (0,0), (6,60), (7,70);
+SELECT * FROM mv_ivm_min_max;
+DELETE FROM mv_base_a WHERE (i,j) IN ((0,0), (7,70));
+SELECT * FROM mv_ivm_min_max;
+DELETE FROM mv_base_a;
+SELECT * FROM mv_ivm_min_max;
+ROLLBACK;
 
 -- support self join view and multiple change on the same table
 BEGIN;
@@ -177,6 +200,30 @@ DELETE FROM ri1 WHERE i=2;
 SELECT * FROM mv_ri ORDER BY i2;
 ROLLBACK;
 
+-- not support subquery for using EXISTS()
+SELECT create_immv('mv_ivm_exists_subquery', 'SELECT a.i, a.j FROM mv_base_a a WHERE EXISTS(SELECT 1 FROM mv_base_b b WHERE a.i = b.i)');
+
+-- support simple subquery in FROM clause
+BEGIN;
+SELECT create_immv('mv_ivm_subquery', 'SELECT a.i,a.j FROM mv_base_a a,( SELECT * FROM mv_base_b) b WHERE a.i = b.i');
+INSERT INTO mv_base_a VALUES(2,20);
+INSERT INTO mv_base_b VALUES(3,300);
+SELECT * FROM mv_ivm_subquery ORDER BY i,j;
+
+ROLLBACK;
+
+-- support join subquery in FROM clause
+BEGIN;
+SELECT create_immv('mv_ivm_join_subquery', 'SELECT i, j, k FROM ( SELECT i, a.j, b.k FROM mv_base_b b INNER JOIN mv_base_a a USING(i)) tmp');
+WITH
+ ai AS (INSERT INTO mv_base_a VALUES (1,11),(2,22) RETURNING 0),
+ bi AS (INSERT INTO mv_base_b VALUES (1,111),(3,133) RETURNING 0),
+ bd AS (DELETE FROM mv_base_b WHERE i = 4 RETURNING 0)
+SELECT;
+SELECT * FROM mv_ivm_join_subquery ORDER BY i,j,k;
+
+ROLLBACK;
+
 -- views including NULL
 BEGIN;
 CREATE TABLE base_t (i int, v int);
@@ -192,6 +239,28 @@ CREATE TABLE base_t (i int);
 SELECT create_immv('mv', 'SELECT * FROM base_t');
 SELECT * FROM mv ORDER BY i;
 INSERT INTO base_t VALUES (1),(NULL);
+SELECT * FROM mv ORDER BY i;
+ROLLBACK;
+
+BEGIN;
+CREATE TABLE base_t (i int, v int);
+INSERT INTO base_t VALUES (NULL, 1), (NULL, 2), (1, 10), (1, 20);
+SELECT create_immv('mv', 'SELECT i, sum(v) FROM base_t GROUP BY i');
+SELECT * FROM mv ORDER BY i;
+UPDATE base_t SET v = v * 10;
+SELECT * FROM mv ORDER BY i;
+ROLLBACK;
+
+BEGIN;
+CREATE TABLE base_t (i int, v int);
+INSERT INTO base_t VALUES (NULL, 1), (NULL, 2), (NULL, 3), (NULL, 4), (NULL, 5);
+SELECT create_immv('mv', 'SELECT i, min(v), max(v) FROM base_t GROUP BY i');
+SELECT * FROM mv ORDER BY i;
+DELETE FROM base_t WHERE v = 1;
+SELECT * FROM mv ORDER BY i;
+DELETE FROM base_t WHERE v = 3;
+SELECT * FROM mv ORDER BY i;
+DELETE FROM base_t WHERE v = 5;
 SELECT * FROM mv ORDER BY i;
 ROLLBACK;
 
@@ -258,7 +327,7 @@ SELECT create_immv('mv_ivm04', 'SELECT i,j,xidsend(xmin) AS x_min FROM mv_base_a
 
 -- contain subquery
 SELECT create_immv('mv_ivm03', 'SELECT i,j FROM mv_base_a WHERE i IN (SELECT i FROM mv_base_b WHERE k < 103 )');
-SELECT create_immv('mv_ivm04', 'SELECT a.i,a.j FROM mv_base_a a, (SELECT * FROM mv_base_b) b WHERE a.i = b.i');
+SELECT create_immv('mv_ivm04', 'SELECT a.i,a.j FROM mv_base_a a, (SELECT DISTINCT i FROM mv_base_b) b WHERE a.i = b.i');
 SELECT create_immv('mv_ivm05', 'SELECT i,j, (SELECT k FROM mv_base_b b WHERE a.i = b.i) FROM mv_base_a a');
 -- contain ORDER BY
 SELECT create_immv('mv_ivm07', 'SELECT i,j,k FROM mv_base_a a INNER JOIN mv_base_b b USING(i) ORDER BY i,j,k');
@@ -289,6 +358,12 @@ SELECT create_immv('mv_ivm15', 'SELECT i, j FROM mv_base_a TABLESAMPLE SYSTEM(50
 -- window functions are not supported
 SELECT create_immv('mv_ivm16', 'SELECT *, cume_dist() OVER (ORDER BY i) AS rank FROM mv_base_a');
 
+-- aggregate function with some options is not supported
+SELECT create_immv('mv_ivm17', 'SELECT COUNT(*) FILTER(WHERE i < 3) FROM mv_base_a');
+SELECT create_immv('mv_ivm18', 'SELECT COUNT(DISTINCT i)  FROM mv_base_a');
+SELECT create_immv('mv_ivm19', 'SELECT array_agg(j ORDER BY i DESC) FROM mv_base_a');
+SELECT create_immv('mv_ivm20', 'SELECT i,SUM(j) FROM mv_base_a GROUP BY GROUPING SETS((i),())');
+
 -- inheritance parent is not supported
 BEGIN;
 CREATE TABLE parent (i int, v int);
@@ -299,17 +374,29 @@ ROLLBACK;
 -- UNION statement is not supported
 SELECT create_immv('mv_ivm22', 'SELECT i,j FROM mv_base_a UNION ALL SELECT i,k FROM mv_base_b');
 
+-- DISTINCT clause in nested query are not supported
+SELECT create_immv('mv_ivm23', 'SELECT * FROM (SELECT DISTINCT i,j FROM mv_base_a) AS tmp');;
+
 -- empty target list is not allowed with IVM
 SELECT create_immv('mv_ivm25', 'SELECT FROM mv_base_a');
 
 -- FOR UPDATE/SHARE is not supported
 SELECT create_immv('mv_ivm26', 'SELECT i,j FROM mv_base_a FOR UPDATE');
+SELECT create_immv('mv_ivm27', 'SELECT * FROM (SELECT i,j FROM mv_base_a FOR UPDATE) AS tmp;');
 
 -- tartget list cannot contain ivm column that start with '__ivm'
 SELECT create_immv('mv_ivm28', 'SELECT i AS "__ivm_count__" FROM mv_base_a');
 
+-- expressions specified in GROUP BY must appear in the target list.
+SELECT create_immv('mv_ivm29', 'SELECT COUNT(i) FROM mv_base_a GROUP BY i;');
+
+-- experssions containing an aggregate is not supported
+SELECT create_immv('mv_ivm30', 'SELECT sum(i)*0.5 FROM mv_base_a');
+SELECT create_immv('mv_ivm31', 'SELECT sum(i)/sum(j) FROM mv_base_a');
+
 -- VALUES is not supported
 SELECT create_immv('mv_ivm_only_values1', 'values(1)');
+SELECT create_immv('mv_ivm_only_values2',  'SELECT * FROM (values(1)) AS tmp');
 
 
 -- base table which has row level security

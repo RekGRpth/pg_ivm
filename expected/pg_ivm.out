@@ -14,7 +14,6 @@ INSERT INTO mv_base_b VALUES
   (2,102),
   (3,103),
   (4,104);
--- CREATE INCREMENTAL MATERIALIZED VIEW mv_ivm_1 AS SELECT i,j,k FROM mv_base_a a INNER JOIN mv_base_b b USING(i) WITH NO DATA;
 SELECT create_immv('mv_ivm_1', 'SELECT i,j,k FROM mv_base_a a INNER JOIN mv_base_b b USING(i)');
 NOTICE:  could not create an index on immv "mv_ivm_1" automatically
 DETAIL:  This target list does not have all the primary key columns, or this view does not contain GROUP BY or DISTINCT clause.
@@ -388,11 +387,93 @@ SELECT * FROM mv_ivm_avg_bug ORDER BY 1,2,3;
 (5 rows)
 
 ROLLBACK;
--- not support MIN(), MAX() aggregate functions
-SELECT create_immv('mv_ivm_min_max', 'SELECT i, MIN(j)  FROM mv_base_a GROUP BY i');
-ERROR:  aggregate function min(integer) is not supported on incrementally maintainable materialized view
-SELECT create_immv('mv_ivm_min_max', 'SELECT i, MAX(j)  FROM mv_base_a GROUP BY i');
-ERROR:  aggregate function max(integer) is not supported on incrementally maintainable materialized view
+-- support MIN(), MAX() aggregate functions
+BEGIN;
+SELECT create_immv('mv_ivm_min_max', 'SELECT i, MIN(j), MAX(j)  FROM mv_base_a GROUP BY i');
+NOTICE:  created index "mv_ivm_min_max_index" on immv "mv_ivm_min_max"
+ create_immv 
+-------------
+           5
+(1 row)
+
+SELECT * FROM mv_ivm_min_max ORDER BY 1,2,3;
+ i | min | max | __ivm_count_min__ | __ivm_count_max__ | __ivm_count__ 
+---+-----+-----+-------------------+-------------------+---------------
+ 1 |  10 |  10 |                 1 |                 1 |             1
+ 2 |  20 |  20 |                 1 |                 1 |             1
+ 3 |  30 |  30 |                 1 |                 1 |             1
+ 4 |  40 |  40 |                 1 |                 1 |             1
+ 5 |  50 |  50 |                 1 |                 1 |             1
+(5 rows)
+
+INSERT INTO mv_base_a VALUES
+  (1,11), (1,12),
+  (2,21), (2,22),
+  (3,31), (3,32),
+  (4,41), (4,42),
+  (5,51), (5,52);
+SELECT * FROM mv_ivm_min_max ORDER BY 1,2,3;
+ i | min | max | __ivm_count_min__ | __ivm_count_max__ | __ivm_count__ 
+---+-----+-----+-------------------+-------------------+---------------
+ 1 |  10 |  12 |                 3 |                 3 |             3
+ 2 |  20 |  22 |                 3 |                 3 |             3
+ 3 |  30 |  32 |                 3 |                 3 |             3
+ 4 |  40 |  42 |                 3 |                 3 |             3
+ 5 |  50 |  52 |                 3 |                 3 |             3
+(5 rows)
+
+DELETE FROM mv_base_a WHERE (i,j) IN ((1,10), (2,21), (3,32));
+SELECT * FROM mv_ivm_min_max ORDER BY 1,2,3;
+ i | min | max | __ivm_count_min__ | __ivm_count_max__ | __ivm_count__ 
+---+-----+-----+-------------------+-------------------+---------------
+ 1 |  11 |  12 |                 2 |                 2 |             2
+ 2 |  20 |  22 |                 2 |                 2 |             2
+ 3 |  30 |  31 |                 2 |                 2 |             2
+ 4 |  40 |  42 |                 3 |                 3 |             3
+ 5 |  50 |  52 |                 3 |                 3 |             3
+(5 rows)
+
+ROLLBACK;
+-- support MIN(), MAX() aggregate functions without GROUP clause
+BEGIN;
+SELECT create_immv('mv_ivm_min_max', 'SELECT MIN(j), MAX(j)  FROM mv_base_a');
+NOTICE:  could not create an index on immv "mv_ivm_min_max" automatically
+DETAIL:  This target list does not have all the primary key columns, or this view does not contain GROUP BY or DISTINCT clause.
+HINT:  Create an index on the immv for efficient incremental maintenance.
+ create_immv 
+-------------
+           1
+(1 row)
+
+SELECT * FROM mv_ivm_min_max;
+ min | max | __ivm_count_min__ | __ivm_count_max__ | __ivm_count__ 
+-----+-----+-------------------+-------------------+---------------
+  10 |  50 |                 5 |                 5 |             5
+(1 row)
+
+INSERT INTO mv_base_a VALUES
+  (0,0), (6,60), (7,70);
+SELECT * FROM mv_ivm_min_max;
+ min | max | __ivm_count_min__ | __ivm_count_max__ | __ivm_count__ 
+-----+-----+-------------------+-------------------+---------------
+   0 |  70 |                 8 |                 8 |             8
+(1 row)
+
+DELETE FROM mv_base_a WHERE (i,j) IN ((0,0), (7,70));
+SELECT * FROM mv_ivm_min_max;
+ min | max | __ivm_count_min__ | __ivm_count_max__ | __ivm_count__ 
+-----+-----+-------------------+-------------------+---------------
+  10 |  60 |                 6 |                 6 |             6
+(1 row)
+
+DELETE FROM mv_base_a;
+SELECT * FROM mv_ivm_min_max;
+ min | max | __ivm_count_min__ | __ivm_count_max__ | __ivm_count__ 
+-----+-----+-------------------+-------------------+---------------
+     |     |                 0 |                 0 |             0
+(1 row)
+
+ROLLBACK;
 -- support self join view and multiple change on the same table
 BEGIN;
 CREATE TABLE base_t (i int, v int);
@@ -523,6 +604,68 @@ SELECT * FROM mv_ri ORDER BY i2;
 (2 rows)
 
 ROLLBACK;
+-- not support subquery for using EXISTS()
+SELECT create_immv('mv_ivm_exists_subquery', 'SELECT a.i, a.j FROM mv_base_a a WHERE EXISTS(SELECT 1 FROM mv_base_b b WHERE a.i = b.i)');
+ERROR:  this query is not allowed on incrementally maintainable materialized view
+HINT:  Only simple subquery is supported
+-- support simple subquery in FROM clause
+BEGIN;
+SELECT create_immv('mv_ivm_subquery', 'SELECT a.i,a.j FROM mv_base_a a,( SELECT * FROM mv_base_b) b WHERE a.i = b.i');
+NOTICE:  could not create an index on immv "mv_ivm_subquery" automatically
+DETAIL:  This target list does not have all the primary key columns, or this view does not contain GROUP BY or DISTINCT clause.
+HINT:  Create an index on the immv for efficient incremental maintenance.
+ create_immv 
+-------------
+           4
+(1 row)
+
+INSERT INTO mv_base_a VALUES(2,20);
+INSERT INTO mv_base_b VALUES(3,300);
+SELECT * FROM mv_ivm_subquery ORDER BY i,j;
+ i | j  
+---+----
+ 1 | 10
+ 2 | 20
+ 2 | 20
+ 3 | 30
+ 3 | 30
+ 4 | 40
+(6 rows)
+
+ROLLBACK;
+-- support join subquery in FROM clause
+BEGIN;
+SELECT create_immv('mv_ivm_join_subquery', 'SELECT i, j, k FROM ( SELECT i, a.j, b.k FROM mv_base_b b INNER JOIN mv_base_a a USING(i)) tmp');
+NOTICE:  could not create an index on immv "mv_ivm_join_subquery" automatically
+DETAIL:  This target list does not have all the primary key columns, or this view does not contain GROUP BY or DISTINCT clause.
+HINT:  Create an index on the immv for efficient incremental maintenance.
+ create_immv 
+-------------
+           4
+(1 row)
+
+WITH
+ ai AS (INSERT INTO mv_base_a VALUES (1,11),(2,22) RETURNING 0),
+ bi AS (INSERT INTO mv_base_b VALUES (1,111),(3,133) RETURNING 0),
+ bd AS (DELETE FROM mv_base_b WHERE i = 4 RETURNING 0)
+SELECT;
+--
+(1 row)
+
+SELECT * FROM mv_ivm_join_subquery ORDER BY i,j,k;
+ i | j  |  k  
+---+----+-----
+ 1 | 10 | 101
+ 1 | 10 | 111
+ 1 | 11 | 101
+ 1 | 11 | 111
+ 2 | 20 | 102
+ 2 | 22 | 102
+ 3 | 30 | 103
+ 3 | 30 | 133
+(8 rows)
+
+ROLLBACK;
 -- views including NULL
 BEGIN;
 CREATE TABLE base_t (i int, v int);
@@ -575,6 +718,70 @@ SELECT * FROM mv ORDER BY i;
  1
   
 (2 rows)
+
+ROLLBACK;
+BEGIN;
+CREATE TABLE base_t (i int, v int);
+INSERT INTO base_t VALUES (NULL, 1), (NULL, 2), (1, 10), (1, 20);
+SELECT create_immv('mv', 'SELECT i, sum(v) FROM base_t GROUP BY i');
+NOTICE:  created index "mv_index" on immv "mv"
+ create_immv 
+-------------
+           2
+(1 row)
+
+SELECT * FROM mv ORDER BY i;
+ i | sum | __ivm_count_sum__ | __ivm_count__ 
+---+-----+-------------------+---------------
+ 1 |  30 |                 2 |             2
+   |   3 |                 2 |             2
+(2 rows)
+
+UPDATE base_t SET v = v * 10;
+SELECT * FROM mv ORDER BY i;
+ i | sum | __ivm_count_sum__ | __ivm_count__ 
+---+-----+-------------------+---------------
+ 1 | 300 |                 2 |             2
+   |  30 |                 2 |             2
+(2 rows)
+
+ROLLBACK;
+BEGIN;
+CREATE TABLE base_t (i int, v int);
+INSERT INTO base_t VALUES (NULL, 1), (NULL, 2), (NULL, 3), (NULL, 4), (NULL, 5);
+SELECT create_immv('mv', 'SELECT i, min(v), max(v) FROM base_t GROUP BY i');
+NOTICE:  created index "mv_index" on immv "mv"
+ create_immv 
+-------------
+           1
+(1 row)
+
+SELECT * FROM mv ORDER BY i;
+ i | min | max | __ivm_count_min__ | __ivm_count_max__ | __ivm_count__ 
+---+-----+-----+-------------------+-------------------+---------------
+   |   1 |   5 |                 5 |                 5 |             5
+(1 row)
+
+DELETE FROM base_t WHERE v = 1;
+SELECT * FROM mv ORDER BY i;
+ i | min | max | __ivm_count_min__ | __ivm_count_max__ | __ivm_count__ 
+---+-----+-----+-------------------+-------------------+---------------
+   |   2 |   5 |                 4 |                 4 |             4
+(1 row)
+
+DELETE FROM base_t WHERE v = 3;
+SELECT * FROM mv ORDER BY i;
+ i | min | max | __ivm_count_min__ | __ivm_count_max__ | __ivm_count__ 
+---+-----+-----+-------------------+-------------------+---------------
+   |   2 |   5 |                 3 |                 3 |             3
+(1 row)
+
+DELETE FROM base_t WHERE v = 5;
+SELECT * FROM mv ORDER BY i;
+ i | min | max | __ivm_count_min__ | __ivm_count_max__ | __ivm_count__ 
+---+-----+-----+-------------------+-------------------+---------------
+   |   2 |   4 |                 2 |                 2 |             2
+(1 row)
 
 ROLLBACK;
 -- IMMV containing user defined type
@@ -651,11 +858,13 @@ SELECT create_immv('mv_ivm04', 'SELECT i,j,xidsend(xmin) AS x_min FROM mv_base_a
 ERROR:  system column is not supported on incrementally maintainable materialized view
 -- contain subquery
 SELECT create_immv('mv_ivm03', 'SELECT i,j FROM mv_base_a WHERE i IN (SELECT i FROM mv_base_b WHERE k < 103 )');
-ERROR:  subquery is not supported on incrementally maintainable materialized view
-SELECT create_immv('mv_ivm04', 'SELECT a.i,a.j FROM mv_base_a a, (SELECT * FROM mv_base_b) b WHERE a.i = b.i');
-ERROR:  subquery is not supported on incrementally maintainable materialized view
+ERROR:  this query is not allowed on incrementally maintainable materialized view
+HINT:  Only simple subquery is supported
+SELECT create_immv('mv_ivm04', 'SELECT a.i,a.j FROM mv_base_a a, (SELECT DISTINCT i FROM mv_base_b) b WHERE a.i = b.i');
+ERROR:  DISTINCT clause in nested query are not supported on incrementally maintainable materialized view
 SELECT create_immv('mv_ivm05', 'SELECT i,j, (SELECT k FROM mv_base_b b WHERE a.i = b.i) FROM mv_base_a a');
-ERROR:  subquery is not supported on incrementally maintainable materialized view
+ERROR:  this query is not allowed on incrementally maintainable materialized view
+HINT:  subquery is not supported in targetlist
 -- contain ORDER BY
 SELECT create_immv('mv_ivm07', 'SELECT i,j,k FROM mv_base_a a INNER JOIN mv_base_b b USING(i) ORDER BY i,j,k');
 ERROR:  ORDER BY clause is not supported on incrementally maintainable materialized view
@@ -673,7 +882,7 @@ ERROR:  VIEW or MATERIALIZED VIEW is not supported on incrementally maintainable
 SELECT create_immv('mv_ivm08', 'SELECT a.i,a.j FROM mv_base_a a,b_mview b WHERE a.i = b.i');
 ERROR:  VIEW or MATERIALIZED VIEW is not supported on incrementally maintainable materialized view
 SELECT create_immv('mv_ivm09', 'SELECT a.i,a.j FROM mv_base_a a, (SELECT i, COUNT(*) FROM mv_base_b GROUP BY i) b WHERE a.i = b.i');
-ERROR:  subquery is not supported on incrementally maintainable materialized view
+ERROR:  aggregate functions in nested query are not supported on incrementally maintainable materialized view
 -- contain mutable functions
 SELECT create_immv('mv_ivm12', 'SELECT i,j FROM mv_base_a WHERE i = random()::int');
 ERROR:  mutable function is not supported on incrementally maintainable materialized view
@@ -690,6 +899,15 @@ ERROR:  TABLESAMPLE clause is not supported on incrementally maintainable materi
 -- window functions are not supported
 SELECT create_immv('mv_ivm16', 'SELECT *, cume_dist() OVER (ORDER BY i) AS rank FROM mv_base_a');
 ERROR:  window functions are not supported on incrementally maintainable materialized view
+-- aggregate function with some options is not supported
+SELECT create_immv('mv_ivm17', 'SELECT COUNT(*) FILTER(WHERE i < 3) FROM mv_base_a');
+ERROR:  aggregate function with FILTER clause is not supported on incrementally maintainable materialized view
+SELECT create_immv('mv_ivm18', 'SELECT COUNT(DISTINCT i)  FROM mv_base_a');
+ERROR:  aggregate function with DISTINCT arguments is not supported on incrementally maintainable materialized view
+SELECT create_immv('mv_ivm19', 'SELECT array_agg(j ORDER BY i DESC) FROM mv_base_a');
+ERROR:  aggregate function with ORDER clause is not supported on incrementally maintainable materialized view
+SELECT create_immv('mv_ivm20', 'SELECT i,SUM(j) FROM mv_base_a GROUP BY GROUPING SETS((i),())');
+ERROR:  GROUPING SETS, ROLLUP, or CUBE clauses is not supported on incrementally maintainable materialized view
 -- inheritance parent is not supported
 BEGIN;
 CREATE TABLE parent (i int, v int);
@@ -700,17 +918,32 @@ ROLLBACK;
 -- UNION statement is not supported
 SELECT create_immv('mv_ivm22', 'SELECT i,j FROM mv_base_a UNION ALL SELECT i,k FROM mv_base_b');
 ERROR:  UNION/INTERSECT/EXCEPT statements are not supported on incrementally maintainable materialized view
+-- DISTINCT clause in nested query are not supported
+SELECT create_immv('mv_ivm23', 'SELECT * FROM (SELECT DISTINCT i,j FROM mv_base_a) AS tmp');;
+ERROR:  DISTINCT clause in nested query are not supported on incrementally maintainable materialized view
 -- empty target list is not allowed with IVM
 SELECT create_immv('mv_ivm25', 'SELECT FROM mv_base_a');
 ERROR:  empty target list is not supported on incrementally maintainable materialized view
 -- FOR UPDATE/SHARE is not supported
 SELECT create_immv('mv_ivm26', 'SELECT i,j FROM mv_base_a FOR UPDATE');
 ERROR:  FOR UPDATE/SHARE clause is not supported on incrementally maintainable materialized view
+SELECT create_immv('mv_ivm27', 'SELECT * FROM (SELECT i,j FROM mv_base_a FOR UPDATE) AS tmp;');
+ERROR:  FOR UPDATE/SHARE clause is not supported on incrementally maintainable materialized view
 -- tartget list cannot contain ivm column that start with '__ivm'
 SELECT create_immv('mv_ivm28', 'SELECT i AS "__ivm_count__" FROM mv_base_a');
 ERROR:  column name __ivm_count__ is not supported on incrementally maintainable materialized view
+-- expressions specified in GROUP BY must appear in the target list.
+SELECT create_immv('mv_ivm29', 'SELECT COUNT(i) FROM mv_base_a GROUP BY i;');
+ERROR:  GROUP BY expression not appearing in select list is not supported on incrementally maintainable materialized view
+-- experssions containing an aggregate is not supported
+SELECT create_immv('mv_ivm30', 'SELECT sum(i)*0.5 FROM mv_base_a');
+ERROR:  expression containing an aggregate in it is not supported on incrementally maintainable materialized view
+SELECT create_immv('mv_ivm31', 'SELECT sum(i)/sum(j) FROM mv_base_a');
+ERROR:  expression containing an aggregate in it is not supported on incrementally maintainable materialized view
 -- VALUES is not supported
 SELECT create_immv('mv_ivm_only_values1', 'values(1)');
+ERROR:  VALUES is not supported on incrementally maintainable materialized view
+SELECT create_immv('mv_ivm_only_values2',  'SELECT * FROM (values(1)) AS tmp');
 ERROR:  VALUES is not supported on incrementally maintainable materialized view
 -- base table which has row level security
 DROP USER IF EXISTS ivm_admin;
