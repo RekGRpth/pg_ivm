@@ -168,6 +168,14 @@ WITH
  dlt_t AS (DELETE FROM base_t WHERE i IN (4,5)  RETURNING 1)
 SELECT NULL;
 SELECT * FROM mv_self ORDER BY v1;
+
+--- with sub-transactions
+SAVEPOINT p1;
+INSERT INTO base_t VALUES (7,70);
+RELEASE SAVEPOINT p1;
+INSERT INTO base_t VALUES (7,77);
+SELECT * FROM mv_self ORDER BY v1, v2;
+
 ROLLBACK;
 
 -- support simultaneous table changes
@@ -451,6 +459,11 @@ INSERT INTO mv_ivm_1 VALUES(1,1,1);
 UPDATE  mv_ivm_1 SET k = 1 WHERE i = 1;
 DELETE FROM mv_ivm_1;
 TRUNCATE mv_ivm_1;
+
+-- get_immv_def function
+SELECT immvrelid, get_immv_def(immvrelid) FROM pg_ivm_immv ORDER BY 1;
+-- mv_base_b is not immv
+SELECT 'mv_base_b'::regclass, get_immv_def('mv_base_b');
 
 DROP TABLE mv_base_b CASCADE;
 DROP TABLE mv_base_a CASCADE;
