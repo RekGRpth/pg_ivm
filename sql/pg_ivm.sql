@@ -150,6 +150,25 @@ DELETE FROM mv_base_a;
 SELECT * FROM mv_ivm_min_max;
 ROLLBACK;
 
+-- aggregate views with column names specified
+BEGIN;
+SELECT create_immv('mv_ivm_agg(a)', 'SELECT i, SUM(j) FROM mv_base_a GROUP BY i');
+INSERT INTO mv_base_a VALUES (1,100), (2,200), (3,300);
+UPDATE mv_base_a SET j = 2000 WHERE (i,j) = (2,20);
+DELETE FROM mv_base_a WHERE (i,j) = (3,30);
+SELECT * FROM mv_ivm_agg ORDER BY 1,2;
+ROLLBACK;
+BEGIN;
+SELECT create_immv('mv_ivm_agg(a,b)', 'SELECT i, SUM(j) FROM mv_base_a GROUP BY i');
+INSERT INTO mv_base_a VALUES (1,100), (2,200), (3,300);
+UPDATE mv_base_a SET j = 2000 WHERE (i,j) = (2,20);
+DELETE FROM mv_base_a WHERE (i,j) = (3,30);
+SELECT * FROM mv_ivm_agg ORDER BY 1,2;
+ROLLBACK;
+BEGIN;
+SELECT create_immv('mv_ivm_agg(a,b,c)', 'SELECT i, SUM(j) FROM mv_base_a GROUP BY i');
+ROLLBACK;
+
 -- support self join view and multiple change on the same table
 BEGIN;
 CREATE TABLE base_t (i int, v int);
@@ -453,6 +472,25 @@ DROP TABLE num_tbl CASCADE;
 
 DROP USER ivm_user;
 DROP USER ivm_admin;
+
+-- automatic index creation
+BEGIN;
+CREATE TABLE base_a (i int primary key, j int);
+CREATE TABLE base_b (i int primary key, j int);
+
+--- group by: create an index
+SELECT create_immv('mv_idx1', 'SELECT i, sum(j) FROM base_a GROUP BY i');
+
+--- distinct: create an index
+SELECT create_immv('mv_idx2', 'SELECT DISTINCT j FROM base_a');
+
+--- with all pkey columns: create an index
+SELECT create_immv('mv_idx3(i_a, i_b)', 'SELECT a.i, b.i FROM base_a a, base_b b');
+
+--- missing some pkey columns: no index
+SELECT create_immv('mv_idx4', 'SELECT j FROM base_a');
+SELECT create_immv('mv_idx5', 'SELECT a.i, b.j FROM base_a a, base_b b');
+ROLLBACK;
 
 -- prevent IMMV chanages
 INSERT INTO mv_ivm_1 VALUES(1,1,1);

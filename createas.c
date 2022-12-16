@@ -31,6 +31,7 @@
 #include "nodes/nodeFuncs.h"
 #include "nodes/pathnodes.h"
 #include "optimizer/optimizer.h"
+#include "optimizer/prep.h"
 #include "parser/parser.h"
 #include "parser/parsetree.h"
 #include "parser/parse_clause.h"
@@ -288,6 +289,15 @@ rewriteQueryForIMMV(Query *query, List *colNames)
 	ParseState *pstate = make_parsestate(NULL);
 	FuncCall *fn;
 
+	/*
+	 * Check the length of colunm name list not to override names of
+	 * additional columns
+	 */
+	if (list_length(colNames) > list_length(query->targetList))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("too many column names were specified")));
+
 	rewritten = copyObject(query);
 	pstate->p_expr_kind = EXPR_KIND_SELECT_TARGET;
 
@@ -320,10 +330,11 @@ rewriteQueryForIMMV(Query *query, List *colNames)
 		foreach(lc, rewritten->targetList)
 		{
 			TargetEntry *tle = (TargetEntry *) lfirst(lc);
-			char *resname = (colNames == NIL ? tle->resname : strVal(list_nth(colNames, tle->resno - 1)));
+			char *resname = (colNames == NIL || foreach_current_index(lc) >= list_length(colNames) ?
+								tle->resname : strVal(list_nth(colNames, tle->resno - 1)));
 
 			if (IsA(tle->expr, Aggref))
-				makeIvmAggColumn(pstate, (Aggref *)tle->expr, resname, &next_resno, &aggs);
+				makeIvmAggColumn(pstate, (Aggref *) tle->expr, resname, &next_resno, &aggs);
 		}
 		rewritten->targetList = list_concat(rewritten->targetList, aggs);
 	}
@@ -623,6 +634,18 @@ CreateIvmTrigger(Oid relOid, Oid viewOid, int16 type, int16 timing, bool ex_lock
 			transitionRels = lappend(transitionRels, n);
 		}
 	}
+
+	/*
+	 * XXX: When using DELETE or UPDATE, we must use exclusive lock for now
+	 * because apply_old_delta(_with_count) doesn't work in concurrent situations.
+	 *
+	 * If the view doesn't have aggregate, distinct, or tuple duplicate, then it
+	 * would work. However, we don't have any way to guarantee the view has a unique
+	 * key before opening the IMMV at the maintenance time because users may drop
+	 * the unique index. We need something to resolve the issue!!
+	 */
+	if (type == TRIGGER_TYPE_DELETE || type == TRIGGER_TYPE_UPDATE)
+		ex_lock = true;
 
 	ivm_trigger->funcname =
 		(timing == TRIGGER_TYPE_BEFORE ? SystemFuncName("IVM_immediate_before") : SystemFuncName("IVM_immediate_maintenance"));
@@ -1287,9 +1310,6 @@ get_primary_key_attnos_from_query(Query *query, List **constraintList, bool is_c
 	int i;
 	Bitmapset *keys = NULL;
 	Relids	rels_in_from;
-#if defined(PG_VERSION_NUM) && (PG_VERSION_NUM >= 140000)
-	PlannerInfo root;
-#endif
 
 	/*
 	 * Collect primary key attributes from all tables used in query. The key attributes
@@ -1341,28 +1361,25 @@ get_primary_key_attnos_from_query(Query *query, List **constraintList, bool is_c
 		if (IsA(tle->expr, Var))
 		{
 			Var *var = (Var*) tle->expr;
-			Bitmapset *attnos = list_nth(key_attnos_list, var->varno - 1);
+			Bitmapset *key_attnos = list_nth(key_attnos_list, var->varno - 1);
 
 			/* check if this attribute is from a base table's primary key */
-			if (bms_is_member(var->varattno - FirstLowInvalidHeapAttributeNumber, attnos))
+			if (bms_is_member(var->varattno - FirstLowInvalidHeapAttributeNumber, key_attnos))
 			{
 				/*
 				 * Remove found key attributes from key_attnos_list, and add this
 				 * to the result list.
 				 */
-				bms_del_member(attnos, var->varattno - FirstLowInvalidHeapAttributeNumber);
+				bms_del_member(key_attnos, var->varattno - FirstLowInvalidHeapAttributeNumber);
 				keys = bms_add_member(keys, i - FirstLowInvalidHeapAttributeNumber);
 			}
 		}
 		i++;
 	}
 
-	/* Collect relations appearing in the FROM clause */
-#if defined(PG_VERSION_NUM) && (PG_VERSION_NUM >= 140000)
-	rels_in_from = pull_varnos_of_level(&root, (Node *)query->jointree, 0);
-#else
-	rels_in_from = pull_varnos_of_level((Node *)query->jointree, 0);
-#endif
+	/* Collect RTE indexes of relations appearing in the FROM clause */
+	rels_in_from = get_relids_in_jointree((Node *) query->jointree, false);
+
 	/*
 	 * Check if all key attributes of relations in FROM are appearing in the target
 	 * list.  If an attribute remains in key_attnos_list in spite of the table is used
