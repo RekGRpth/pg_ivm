@@ -78,6 +78,9 @@ typedef struct MV_QueryHashEntry
 {
 	MV_QueryKey key;
 	SPIPlanPtr	plan;
+	OverrideSearchPath *search_path;	/* search_path used for parsing
+										 * and planning */
+
 } MV_QueryHashEntry;
 
 /*
@@ -207,8 +210,6 @@ static SPIPlanPtr mv_FetchPreparedPlan(MV_QueryKey *key);
 static void mv_HashPreparedPlan(MV_QueryKey *key, SPIPlanPtr plan);
 static void mv_BuildQueryKey(MV_QueryKey *key, Oid matview_id, int32 query_type);
 static void clean_up_IVM_hash_entry(MV_TriggerHashEntry *entry, bool is_abort);
-
-static List *get_securityQuals(Oid relId, int rt_index, Query *query);
 
 /* SQL callable functions */
 PG_FUNCTION_INFO_V1(IVM_immediate_before);
@@ -1159,7 +1160,31 @@ rewrite_query_for_preupdate_state(Query *query, List *tables,
 				 */
 				if (r->relid == table->table_id)
 				{
-					lfirst(lc) = get_prestate_rte(r, table, pstate->p_queryEnv, matviewid);
+					List *securityQuals;
+					List *withCheckOptions;
+					bool  hasRowSecurity;
+					bool  hasSubLinks;
+
+					RangeTblEntry *rte_pre = get_prestate_rte(r, table, pstate->p_queryEnv, matviewid);
+
+					/*
+					 * Set a row security poslicies of the modified table to the subquery RTE which
+					 * represents the pre-update state of the table.
+					 */
+					get_row_security_policies(query, table->original_rte, i,
+											  &securityQuals, &withCheckOptions,
+											  &hasRowSecurity, &hasSubLinks);
+					if (hasRowSecurity)
+					{
+						query->hasRowSecurity = true;
+						rte_pre->security_barrier = true;
+					}
+					if (hasSubLinks)
+						query->hasSubLinks = true;
+
+					rte_pre->securityQuals = securityQuals;
+					lfirst(lc) = rte_pre;
+
 					table->rte_paths = lappend(table->rte_paths, lappend_int(list_copy(rte_path), i));
 					break;
 				}
@@ -1212,8 +1237,6 @@ register_delta_ENRs(ParseState *pstate, Query *query, List *tables)
 
 			nsitem = addRangeTableEntryForENR(pstate, makeRangeVar(NULL, enr->md.name, -1), true);
 			rte = nsitem->p_rte;
-			/* if base table has RLS, set security condition to enr */
-			rte->securityQuals = get_securityQuals(table->table_id, list_length(query->rtable) + 1, query);
 
 			query->rtable = lappend(query->rtable, rte);
 			table->old_rtes = lappend(table->old_rtes, rte);
@@ -1239,8 +1262,6 @@ register_delta_ENRs(ParseState *pstate, Query *query, List *tables)
 
 			nsitem = addRangeTableEntryForENR(pstate, makeRangeVar(NULL, enr->md.name, -1), true);
 			rte = nsitem->p_rte;
-			/* if base table has RLS, set security condition to enr*/
-			rte->securityQuals = get_securityQuals(table->table_id, list_length(query->rtable) + 1, query);
 
 			query->rtable = lappend(query->rtable, rte);
 			table->new_rtes = lappend(table->new_rtes, rte);
@@ -1330,7 +1351,7 @@ get_prestate_rte(RangeTblEntry *rte, MV_TriggerTable *table,
 	initStringInfo(&str);
 	appendStringInfo(&str,
 		"SELECT t.* FROM %s t"
-		" WHERE ivm_visible_in_prestate(t.tableoid, t.ctid ,%d::oid)",
+		" WHERE pg_catalog.ivm_visible_in_prestate(t.tableoid, t.ctid ,%d::pg_catalog.oid)",
 			relname, matviewid);
 
 	for (i = 0; i < list_length(table->old_tuplestores); i++)
@@ -1347,27 +1368,6 @@ get_prestate_rte(RangeTblEntry *rte, MV_TriggerTable *table,
 	raw = (RawStmt*)linitial(raw_parser(str.data));
 #endif
 	sub = transformStmt(pstate, raw->stmt);
-
-	/* If this query has setOperations, RTEs in rtables has a subquery which contains ENR */
-	if (sub->setOperations != NULL)
-	{
-		ListCell *lc;
-
-		/* add securityQuals for tuplestores */
-		foreach (lc, sub->rtable)
-		{
-			RangeTblEntry *rte;
-			RangeTblEntry *sub_rte;
-
-			rte = (RangeTblEntry *)lfirst(lc);
-			Assert(rte->subquery != NULL);
-
-			sub_rte = (RangeTblEntry *)linitial(rte->subquery->rtable);
-			if (sub_rte->rtekind == RTE_NAMEDTUPLESTORE)
-				/* rt_index is always 1, bacause subquery has enr_rte only */
-				sub_rte->securityQuals = get_securityQuals(sub_rte->relid, 1, sub);
-		}
-	}
 
 	/* save the original RTE */
 	table->original_rte = copyObject(rte);
@@ -1413,8 +1413,8 @@ make_delta_enr_name(const char *prefix, Oid relid, int count)
 /*
  * union_ENRs
  *
- * Make a single table delta by unionning all transition tables of the modified table
- * whose RTE is specified by
+ * Replace RTE of the modified table with a single table delta that combine its
+ * all transition tables.
  */
 static RangeTblEntry*
 union_ENRs(RangeTblEntry *rte, Oid relid, List *enr_rtes, const char *prefix,
@@ -1425,7 +1425,9 @@ union_ENRs(RangeTblEntry *rte, Oid relid, List *enr_rtes, const char *prefix,
 	RawStmt *raw;
 	Query *sub;
 	int	i;
-	RangeTblEntry *enr_rte;
+
+	/* the previous RTE must be a subquery which represents "pre-state" table */
+	Assert(rte->rtekind == RTE_SUBQUERY);
 
 	/* Create a ParseState for rewriting the view definition query */
 	pstate = make_parsestate(NULL);
@@ -1451,26 +1453,13 @@ union_ENRs(RangeTblEntry *rte, Oid relid, List *enr_rtes, const char *prefix,
 #endif
 	sub = transformStmt(pstate, raw->stmt);
 
-	rte->rtekind = RTE_SUBQUERY;
+	/*
+	 * Update the subquery so that it represent the combined transition
+	 * table.  Note that we leave the security_barrier and securityQuals
+	 * fields so that the subquery relation can be protected by the RLS
+	 * policy as same as the modified table.
+	 */
 	rte->subquery = sub;
-	rte->security_barrier = false;
-	/* Clear fields that should not be set in a subquery RTE */
-	rte->relid = InvalidOid;
-	rte->relkind = 0;
-	rte->rellockmode = 0;
-	rte->tablesample = NULL;
-	rte->inh = false;			/* must not be set for a subquery */
-
-	rte->requiredPerms = 0;		/* no permission check on subquery itself */
-	rte->checkAsUser = InvalidOid;
-	rte->selectedCols = NULL;
-	rte->insertedCols = NULL;
-	rte->updatedCols = NULL;
-	rte->extraUpdatedCols = NULL;
-	/* if base table has RLS, set security condition to enr*/
-	enr_rte = (RangeTblEntry *)linitial(sub->rtable);
-	/* rt_index is always 1, bacause subquery has enr_rte only */
-	enr_rte->securityQuals = get_securityQuals(relid, 1, sub);
 
 	return rte;
 }
@@ -1506,9 +1495,9 @@ rewrite_query_for_distinct_and_aggregates(Query *query, ParseState *pstate)
 
 	/* Add count(*) for counting distinct tuples in views */
 #if defined(PG_VERSION_NUM) && (PG_VERSION_NUM >= 140000)
-	fn = makeFuncCall(list_make1(makeString("count")), NIL, COERCE_EXPLICIT_CALL, -1);
+	fn = makeFuncCall(SystemFuncName("count"), NIL, COERCE_EXPLICIT_CALL, -1);
 #else
-	fn = makeFuncCall(list_make1(makeString("count")), NIL, -1);
+	fn = makeFuncCall(SystemFuncName("count"), NIL, -1);
 #endif
 	fn->agg_star = true;
 	if (!query->groupClause && !query->hasAggs)
@@ -1710,7 +1699,7 @@ apply_delta(Oid matviewOid, Tuplestorestate *old_tuplestores, Tuplestorestate *n
 			/* avg */
 			else if (!strcmp(aggname, "avg"))
 				append_set_clause_for_avg(resname, aggs_set_old, aggs_set_new, aggs_list_buf,
-										  format_type_be(aggref->aggtype));
+										  format_type_be_qualified(aggref->aggtype));
 
 			/* min/max */
 			else if (!strcmp(aggname, "min") || !strcmp(aggname, "max"))
@@ -2259,7 +2248,7 @@ apply_old_delta(const char *matviewname, const char *deltaname_old,
 	initStringInfo(&querybuf);
 	appendStringInfo(&querybuf,
 	"DELETE FROM %s WHERE ctid IN ("
-		"SELECT tid FROM (SELECT row_number() over (partition by %s) AS \"__ivm_row_number__\","
+		"SELECT tid FROM (SELECT pg_catalog.row_number() over (partition by %s) AS \"__ivm_row_number__\","
 								  "mv.ctid AS tid,"
 								  "diff.\"__ivm_count__\""
 						 "FROM %s AS mv, %s AS diff "
@@ -2358,7 +2347,7 @@ apply_new_delta(const char *matviewname, const char *deltaname_new,
 	initStringInfo(&querybuf);
 	appendStringInfo(&querybuf,
 					"INSERT INTO %s (%s) SELECT %s FROM ("
-						"SELECT diff.*, generate_series(1, diff.\"__ivm_count__\") AS __ivm_generate_series__ "
+						"SELECT diff.*, pg_catalog.generate_series(1, diff.\"__ivm_count__\") AS __ivm_generate_series__ "
 						"FROM %s AS diff) AS v",
 					matviewname, target_list->data, target_list->data,
 					deltaname_new);
@@ -2757,7 +2746,7 @@ generate_equal(StringInfo querybuf, Oid opttype,
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_FUNCTION),
 				 errmsg("could not identify an equality operator for type %s",
-						format_type_be(opttype))));
+						format_type_be_qualified(opttype))));
 
 	generate_operator_clause(querybuf,
 							 leftop, opttype,
@@ -2821,18 +2810,27 @@ mv_FetchPreparedPlan(MV_QueryKey *key)
 	 *
 	 * CAUTION: this check is only trustworthy if the caller has already
 	 * locked both materialized views and base tables.
+	 *
+	 * Also, check whether the search_path is still the same as when we made it.
+	 * If it isn't, we need to rebuild the query text because the result of
+	 * pg_ivm_get_viewdef() will change.
 	 */
 	plan = entry->plan;
-	if (plan && SPI_plan_is_valid(plan))
+	if (plan && SPI_plan_is_valid(plan) &&
+		OverrideSearchPathMatchesCurrent(entry->search_path))
 		return plan;
 
 	/*
 	 * Otherwise we might as well flush the cached plan now, to free a little
 	 * memory space before we make a new one.
 	 */
-	entry->plan = NULL;
 	if (plan)
 		SPI_freeplan(plan);
+	if (entry->search_path)
+		pfree(entry->search_path);
+
+	entry->plan = NULL;
+	entry->search_path = NULL;
 
 	return NULL;
 }
@@ -2863,6 +2861,7 @@ mv_HashPreparedPlan(MV_QueryKey *key, SPIPlanPtr plan)
 											  HASH_ENTER, &found);
 	Assert(!found || entry->plan == NULL);
 	entry->plan = plan;
+	entry->search_path = GetOverrideSearchPath(TopMemoryContext);
 }
 
 /*
@@ -2959,47 +2958,4 @@ isIvmName(const char *s)
 	if (s)
 		return (strncmp(s, "__ivm_", 6) == 0);
 	return false;
-}
-
-/*
- * get_securityQuals
- *
- * Get row security policy on a relation.
- * This is used by IVM for copying RLS from base table to enr.
- */
-static List *
-get_securityQuals(Oid relId, int rt_index, Query *query)
-{
-	ParseState *pstate;
-	Relation rel;
-	ParseNamespaceItem *nsitem;
-	RangeTblEntry *rte;
-	List *securityQuals;
-	List *withCheckOptions;
-	bool  hasRowSecurity;
-	bool  hasSubLinks;
-
-	securityQuals = NIL;
-	pstate = make_parsestate(NULL);
-
-	rel = table_open(relId, NoLock);
-	nsitem = addRangeTableEntryForRelation(pstate, rel, AccessShareLock, NULL, false, false);
-	rte = nsitem->p_rte;
-
-	get_row_security_policies(query, rte, rt_index,
-							  &securityQuals, &withCheckOptions,
-							  &hasRowSecurity, &hasSubLinks);
-
-	/*
-	 * Make sure the query is marked correctly if row level security
-	 * applies, or if the new quals had sublinks.
-	 */
-	if (hasRowSecurity)
-		query->hasRowSecurity = true;
-	if (hasSubLinks)
-		query->hasSubLinks = true;
-
-	table_close(rel, NoLock);
-
-	return securityQuals;
 }
