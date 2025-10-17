@@ -37,3 +37,5 @@ SELECT pgivm.refresh_immv('mv_not_existing', true);
 
 -- Try to refresh a normal table -- error
 SELECT pgivm.refresh_immv('t', true);
+
+DROP TABLE mv;
