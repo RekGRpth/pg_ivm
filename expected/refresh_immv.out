@@ -116,3 +116,4 @@ ERROR:  relation "mv_not_existing" does not exist
 -- Try to refresh a normal table -- error
 SELECT pgivm.refresh_immv('t', true);
 ERROR:  "t" is not an IMMV
+DROP TABLE mv;

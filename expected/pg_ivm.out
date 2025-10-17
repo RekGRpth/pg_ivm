@@ -1454,6 +1454,13 @@ SELECT pgivm.create_immv('mv_ivm03', 'SELECT i,j,xmin::text AS x_min FROM mv_bas
 ERROR:  system column is not supported on incrementally maintainable materialized view
 SELECT pgivm.create_immv('mv_ivm04', 'SELECT i,j,xidsend(xmin) AS x_min FROM mv_base_a');
 ERROR:  system column is not supported on incrementally maintainable materialized view
+-- targetlist or WHERE clause without EXISTS contain subquery
+SELECT pgivm.create_immv('mv_ivm05', 'SELECT i,j FROM mv_base_a WHERE i IN (SELECT i FROM mv_base_b WHERE k < 103 )');
+ERROR:  this query is not allowed on incrementally maintainable materialized view
+HINT:  sublink only supports subquery with EXISTS clause in WHERE clause
+SELECT pgivm.create_immv('mv_ivm05', 'SELECT i,j, (SELECT k FROM mv_base_b b WHERE a.i = b.i) FROM mv_base_a a');
+ERROR:  this query is not allowed on incrementally maintainable materialized view
+HINT:  sublink only supports subquery with EXISTS clause in WHERE clause
 -- contain ORDER BY
 SELECT pgivm.create_immv('mv_ivm07', 'SELECT i,j,k FROM mv_base_a a INNER JOIN mv_base_b b USING(i) ORDER BY i,j,k');
 ERROR:  ORDER BY clause is not supported on incrementally maintainable materialized view
@@ -1484,7 +1491,7 @@ ERROR:  DISTINCT ON is not supported on incrementally maintainable materialized 
 SELECT pgivm.create_immv('mv_ivm15', 'SELECT i, j FROM mv_base_a TABLESAMPLE SYSTEM(50)');
 ERROR:  TABLESAMPLE clause is not supported on incrementally maintainable materialized view
 -- window functions are not supported
-SELECT pgivm.create_immv('mv_ivm16', 'SELECT *, cume_dist() OVER (ORDER BY i) AS rank FROM mv_base_a');
+SELECT pgivm.create_immv('mv_ivm16', 'SELECT i, j FROM (SELECT *, cume_dist() OVER (ORDER BY i) AS rank FROM mv_base_a) AS t');
 ERROR:  window functions are not supported on incrementally maintainable materialized view
 -- aggregate function with some options is not supported
 SELECT pgivm.create_immv('mv_ivm17', 'SELECT COUNT(*) FILTER(WHERE i < 3) FROM mv_base_a');
@@ -1532,6 +1539,10 @@ SELECT pgivm.create_immv('mv_ivm_only_values1', 'values(1)');
 ERROR:  VALUES is not supported on incrementally maintainable materialized view
 SELECT pgivm.create_immv('mv_ivm_only_values2',  'SELECT * FROM (values(1)) AS tmp');
 ERROR:  VALUES is not supported on incrementally maintainable materialized view
+-- column of parent query specified in EXISTS clause must appear in the target list.
+SELECT pgivm.create_immv('mv_ivm32', 'SELECT a.j FROM mv_base_a a WHERE EXISTS(SELECT 1 FROM mv_base_b b WHERE a.i = b.i)');
+ERROR:  this query is not allowed on incrementally maintainable materialized view
+HINT:  targetlist must contain vars that are referred to in EXISTS subquery
 -- views containing base tables with Row Level Security
 DROP USER IF EXISTS regress_ivm_admin;
 NOTICE:  role "regress_ivm_admin" does not exist, skipping

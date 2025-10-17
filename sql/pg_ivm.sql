@@ -526,6 +526,10 @@ SELECT pgivm.create_immv('mv_ivm02', 'SELECT i,j FROM mv_base_a WHERE xmin = ''6
 SELECT pgivm.create_immv('mv_ivm03', 'SELECT i,j,xmin::text AS x_min FROM mv_base_a');
 SELECT pgivm.create_immv('mv_ivm04', 'SELECT i,j,xidsend(xmin) AS x_min FROM mv_base_a');
 
+-- targetlist or WHERE clause without EXISTS contain subquery
+SELECT pgivm.create_immv('mv_ivm05', 'SELECT i,j FROM mv_base_a WHERE i IN (SELECT i FROM mv_base_b WHERE k < 103 )');
+SELECT pgivm.create_immv('mv_ivm05', 'SELECT i,j, (SELECT k FROM mv_base_b b WHERE a.i = b.i) FROM mv_base_a a');
+
 -- contain ORDER BY
 SELECT pgivm.create_immv('mv_ivm07', 'SELECT i,j,k FROM mv_base_a a INNER JOIN mv_base_b b USING(i) ORDER BY i,j,k');
 -- contain HAVING
@@ -552,7 +556,7 @@ SELECT pgivm.create_immv('mv_ivm14', 'SELECT DISTINCT ON(i) i, j FROM mv_base_a'
 SELECT pgivm.create_immv('mv_ivm15', 'SELECT i, j FROM mv_base_a TABLESAMPLE SYSTEM(50)');
 
 -- window functions are not supported
-SELECT pgivm.create_immv('mv_ivm16', 'SELECT *, cume_dist() OVER (ORDER BY i) AS rank FROM mv_base_a');
+SELECT pgivm.create_immv('mv_ivm16', 'SELECT i, j FROM (SELECT *, cume_dist() OVER (ORDER BY i) AS rank FROM mv_base_a) AS t');
 
 -- aggregate function with some options is not supported
 SELECT pgivm.create_immv('mv_ivm17', 'SELECT COUNT(*) FILTER(WHERE i < 3) FROM mv_base_a');
@@ -594,6 +598,8 @@ SELECT pgivm.create_immv('mv_ivm31', 'SELECT sum(i)/sum(j) FROM mv_base_a');
 SELECT pgivm.create_immv('mv_ivm_only_values1', 'values(1)');
 SELECT pgivm.create_immv('mv_ivm_only_values2',  'SELECT * FROM (values(1)) AS tmp');
 
+-- column of parent query specified in EXISTS clause must appear in the target list.
+SELECT pgivm.create_immv('mv_ivm32', 'SELECT a.j FROM mv_base_a a WHERE EXISTS(SELECT 1 FROM mv_base_b b WHERE a.i = b.i)');
 
 -- views containing base tables with Row Level Security
 DROP USER IF EXISTS regress_ivm_admin;
