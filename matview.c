@@ -5,7 +5,7 @@
  *    Routines for incremental maintenance of IMMVs
  *
  * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
- * Portions Copyright (c) 2022, IVM Development Group
+ * Portions Copyright (c) 2026, IVM Development Group
  *
  *-------------------------------------------------------------------------
  */
@@ -2246,7 +2246,7 @@ multiply_terms(Query *query, List *terms1, List *terms2, Node* qual,
 	ListCell	*l1, *l2;
 	Relids		qual_relids;
 	Relids		qual_relids_l = NULL, qual_relids_r = NULL;
-	Relids		anti_relids_l = NULL, anti_relids_r = NULL;
+	List		*anti_relids_l = NIL, *anti_relids_r = NIL;
 #if defined(PG_VERSION_NUM) && (PG_VERSION_NUM >= 140000)
 	PlannerInfo root;
 #endif
@@ -2338,8 +2338,9 @@ multiply_terms(Query *query, List *terms1, List *terms2, Node* qual,
 			 * If this RHS term is participating in the outer join and the size
 			 * of its inner-joined relids is minimal among such terms, add it to
 			 * the list of anti-joined relids for the LHS terms.  Other terms with
-			 * larger inner-joined relids are eliminated under the condition that
-			 * the join qual is null-rejecting.  For example, in the following term:
+			 * larger inner-joined relids (superset of another) are eliminated under
+			 * the condition that the join qual is null-rejecting.  For example,
+			 * in the following term:
 			 *
 			 *  T anti-join [(R1 join R2) + (R1 anti-join R2)]
 			 *
@@ -2354,17 +2355,31 @@ multiply_terms(Query *query, List *terms1, List *terms2, Node* qual,
 			 *
 			 *  T anti-join (R1 join R2)
 			 *
-			 * The resultant anti_relids_r represents the relids of
+			 * The resultant anti_relids_r represents the list of relids of
 			 * tables that could be anti-joined with every term
 			 * on the LHS.
 			 */
 			Term *rterm = (Term*) lfirst(l1);
 			if (bms_is_subset(qual_relids_r, rterm->relids))
 			{
-				if (!anti_relids_r)
-					anti_relids_r = bms_copy(rterm->relids);
-				else
-					anti_relids_r = bms_int_members(anti_relids_r, rterm->relids);
+				ListCell *lc;
+				bool add = true;
+				foreach(lc, anti_relids_r)
+				{
+					Relids relids = (Relids) lfirst(lc);
+					/*
+					 * Remove existing term such that it is a superset of the new one.
+					 * Also, if there is already a term which is a subset of the one that
+					 * we are trying to add, we cannot do it.
+					 */
+					if (bms_is_subset(rterm->relids, relids))
+						anti_relids_r = list_delete_cell(anti_relids_r, lc);
+					else if (bms_is_subset(relids, rterm->relids))
+						add = false;
+				}
+				if (add)
+					anti_relids_r = lappend(anti_relids_r, bms_copy(rterm->relids));
+
 			}
 		}
 	}
@@ -2377,17 +2392,25 @@ multiply_terms(Query *query, List *terms1, List *terms2, Node* qual,
 			/*
 			 * Same, except for the right and left sides.  See the comment above.
 			 *
-			 * The resultant anti_relids_l represents the relids of
+			 * The resultant anti_relids_l represents the list of relids of
 			 * tables that could be anti-joined with every term
 			 * on the RHS.
 			 */
 			Term *lterm = (Term*) lfirst(l1);
 			if (bms_is_subset(qual_relids_l, lterm->relids))
 			{
-				if (!anti_relids_l)
-					anti_relids_l = bms_copy(lterm->relids);
-				else
-					anti_relids_l = bms_int_members(anti_relids_l, lterm->relids);
+				ListCell *lc;
+				bool add = true;
+				foreach(lc, anti_relids_l)
+				{
+					Relids relids = (Relids) lfirst(lc);
+					if (bms_is_subset(lterm->relids, relids))
+						anti_relids_l = list_delete_cell(anti_relids_l, lc);
+					else if (bms_is_subset(relids, lterm->relids))
+						add = false;
+				}
+				if (add)
+					anti_relids_l = lappend(anti_relids_l, bms_copy(lterm->relids));
 			}
 		}
 	}
@@ -2432,7 +2455,7 @@ multiply_terms(Query *query, List *terms1, List *terms2, Node* qual,
 				(jointype == JOIN_RIGHT || jointype == JOIN_FULL))
 			{
 				if (bms_is_subset(qual_relids_r, rterm->relids))
-					rterm->anti_relids = lappend(rterm->anti_relids, bms_copy(anti_relids_l));
+					rterm->anti_relids = list_concat(rterm->anti_relids, list_copy(anti_relids_l));
 			}
 		}
 
@@ -2446,7 +2469,7 @@ multiply_terms(Query *query, List *terms1, List *terms2, Node* qual,
 		if (jointype == JOIN_LEFT || jointype == JOIN_FULL)
 		{
 			if (bms_is_subset(qual_relids_l, lterm->relids))
-				lterm->anti_relids = lappend(lterm->anti_relids, bms_copy(anti_relids_r));
+				lterm->anti_relids = list_concat(lterm->anti_relids, list_copy(anti_relids_r));
 		}
 	}
 
@@ -2473,9 +2496,9 @@ multiply_terms(Query *query, List *terms1, List *terms2, Node* qual,
 	bms_free(qual_relids_l);
 	bms_free(qual_relids_r);
 	if (anti_relids_l)
-		bms_free(anti_relids_l);
+		list_free(anti_relids_l);
 	if (anti_relids_r)
-		bms_free(anti_relids_r);
+		list_free(anti_relids_r);
 
 	return result;
 }
@@ -4161,6 +4184,9 @@ insert_dangling_tuples(List *terms, Query *query,
 		{
 			OuterJoinRelInfo *info;
 			bool found = false;
+			StringInfoData joined_cols;
+
+			initStringInfo(&joined_cols);
 
 			/* seach outer-join relation info */
 			foreach (lc1, outerjoin_relinfo)
@@ -4210,11 +4236,16 @@ insert_dangling_tuples(List *terms, Query *query,
 				char   *diff_resname = quote_qualified_identifier("diff", resname);
 
 				appendStringInfo(&exists_cond, "%s", exists_cond.len ? " AND " : "");
+				appendStringInfo(&exists_cond, "(");
 				generate_equal(&exists_cond, attr->atttypid,  mv_resname, diff_resname);
+				appendStringInfo(&exists_cond, " OR (%s IS NULL AND %s IS NULL))",
+						 mv_resname, diff_resname);
 
-				appendStringInfo(&joined_cond, "%s%s IS NOT NULL",
-								 joined_cond.len ? " AND " : "", resname);
+				appendStringInfo(&joined_cols, "%s%s",
+								 joined_cols.len ? "," : "", resname);
 			}
+			appendStringInfo(&joined_cond, "%s(NOT (%s) IS NULL)",
+							 joined_cond.len ? " AND " : "", joined_cols.data);
 
 			/* counting the number of tuples to be inserted */
 			appendStringInfo(&count, "%s(__ivm_meta__->'%d')::pg_catalog.int8",
@@ -4229,8 +4260,11 @@ insert_dangling_tuples(List *terms, Query *query,
 		foreach(lc1, anti_relids_modified)
 		{
 			Relids anti_relids = (Relids) lfirst(lc1);
+			StringInfoData joined_cols;
 
-			appendStringInfo(&joined_in_delta_cond, "%s%s",
+			initStringInfo(&joined_cols);
+
+			appendStringInfo(&joined_in_delta_cond, "%s (%s) ",
 							 joined_in_delta_cond.len ? "OR" : "", joined_cond.data);
 
 			i = -1;
@@ -4262,8 +4296,12 @@ insert_dangling_tuples(List *terms, Query *query,
 				{
 					Form_pg_attribute attr = (Form_pg_attribute) lfirst(lc2);
 					char *resname = NameStr(attr->attname);
-					appendStringInfo(&joined_in_delta_cond, " AND %s IS NOT NULL", resname);
+					appendStringInfo(&joined_cols, "%s%s",
+									 joined_cols.len ? "," : "", resname);
 				}
+
+				appendStringInfo(&joined_cond, "%s(NOT (%s) IS NULL)",
+								 joined_cond.len ? " AND " : "", joined_cols.data);
 			}
 		}
 
@@ -4308,7 +4346,7 @@ insert_dangling_tuples(List *terms, Query *query,
  * The deletion is performed per term in the normalized form of the
  * outer join query. Each term is an inner join of some base tables,
  * which is usually null-extended due to one or more anti-joins with
- * other base tables. Dangling tuples in a term can be deleted from 
+ * other base tables. Dangling tuples in a term can be deleted from
  * the view when the modified table is among the anti-joined tables.
  *
  * When a tuple is inserted into a table anti-joined in a term,
@@ -4351,6 +4389,7 @@ delete_dangling_tuples(List *terms, Query *query,
 		StringInfoData key_cols;
 		StringInfoData joined_cond;
 		StringInfoData joined_in_delta_cond;
+		StringInfoData exists_cond;
 		Term *term = lfirst(lc);
 		List	*anti_relids_modified = NULL;
 
@@ -4371,11 +4410,16 @@ delete_dangling_tuples(List *terms, Query *query,
 		initStringInfo(&dangling_cond);
 		initStringInfo(&key_cols);
 		initStringInfo(&joined_cond);
+		initStringInfo(&exists_cond);
 
 		/* for each table invloving in the outer join */
 		foreach (lc1, outerjoin_relinfo)
 		{
 			OuterJoinRelInfo *info = lfirst(lc1);
+			StringInfoData joined_cond2;
+			StringInfoData dangling_cond2;
+			initStringInfo(&joined_cond2);
+			initStringInfo(&dangling_cond2);
 
 			/*
 			 * Build the condition to check whether a tuple belongs to this term,
@@ -4394,17 +4438,33 @@ delete_dangling_tuples(List *terms, Query *query,
 
 				if (bms_is_member(info->rtindex, term->relids))
 				{
-					appendStringInfo(&dangling_cond, "%s%s IS NOT NULL ",
-									 dangling_cond.len ? " AND " : "" , resname);
-					appendStringInfo(&joined_cond, "%s%s IS NOT NULL ",
-									 joined_cond.len ? " AND " : "", resname);
+					char   *mv_resname = quote_qualified_identifier("mv", resname);
+					char   *diff_resname = quote_qualified_identifier("diff", resname);
+
+					appendStringInfo(&dangling_cond2, "%s%s IS NOT NULL ",
+									 dangling_cond2.len ? " OR " : "" , resname);
+					appendStringInfo(&joined_cond2, "%s%s IS NOT NULL ",
+									 joined_cond2.len ? " OR " : "", diff_resname);
 					appendStringInfo(&key_cols, "%s%s",
 									 key_cols.len ? "," : "", resname);
+
+					appendStringInfo(&exists_cond, "%s", exists_cond.len ? " AND " : "");
+					appendStringInfo(&exists_cond, "(");
+					generate_equal(&exists_cond, attr->atttypid,  mv_resname, diff_resname);
+					appendStringInfo(&exists_cond, " OR (%s IS NULL AND %s IS NULL))",
+									 mv_resname, diff_resname);
 				}
 				else
 					appendStringInfo(&dangling_cond, "%s%s IS NULL ",
 									 dangling_cond.len ? " AND " : "", resname);
 			}
+
+			if(joined_cond2.len > 0)
+				appendStringInfo(&joined_cond, "%s(%s)",
+								 joined_cond.len ? " AND " : "", joined_cond2.data);
+			if(dangling_cond2.len > 0)
+				appendStringInfo(&dangling_cond, "%s(%s)",
+								 dangling_cond.len ? " AND " : "", dangling_cond2.data);
 		}
 
 		/*
@@ -4418,13 +4478,15 @@ delete_dangling_tuples(List *terms, Query *query,
 			int i;
 
 			appendStringInfo(&joined_in_delta_cond, "%s%s",
-							 joined_in_delta_cond.len ? "OR" : "", joined_cond.data);
+							 joined_in_delta_cond.len ? " OR " : "", joined_cond.data);
 
 			i = -1;
 			while ((i = bms_next_member(anti_relids, i)) >= 0)
 			{
 				OuterJoinRelInfo *info;
 				bool found = false;
+				StringInfoData joined_cond2;
+				initStringInfo(&joined_cond2);
 
 				/* seach outer-join relation info */
 				foreach (lc2, outerjoin_relinfo)
@@ -4449,20 +4511,25 @@ delete_dangling_tuples(List *terms, Query *query,
 				{
 					Form_pg_attribute attr = (Form_pg_attribute) lfirst(lc2);
 					char *resname = NameStr(attr->attname);
-					appendStringInfo(&joined_in_delta_cond, " AND %s IS NOT NULL", resname);
+					char   *diff_resname = quote_qualified_identifier("diff", resname);
+					appendStringInfo(&joined_cond2, "%s%s IS NOT NULL ",
+									 joined_cond2.len ? " OR " : "", diff_resname);
 				}
+				if(joined_cond2.len > 0)
+					appendStringInfo(&joined_in_delta_cond, "%s(%s)",
+									 joined_in_delta_cond.len ? " AND " : "", joined_cond2.data);
 			}
 		}
 
 		/* Delete dangling tuples if needed */
 		initStringInfo(&querybuf);
 		appendStringInfo(&querybuf,
-			"DELETE FROM %s "
+			"DELETE FROM %s mv "
 			"WHERE %s AND "
-				"(%s) IN (SELECT %s FROM %s diff WHERE %s)",
+				"EXISTS (SELECT 1 FROM %s diff WHERE %s AND %s)",
 			matviewname,
 			dangling_cond.data,
-			key_cols.data, key_cols.data, deltaname_new, joined_in_delta_cond.data
+			deltaname_new, joined_in_delta_cond.data, exists_cond.data
 		);
 		if (SPI_exec(querybuf.data, 0) != SPI_OK_DELETE)
 			elog(ERROR, "SPI_exec failed: %s", querybuf.data);

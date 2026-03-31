@@ -1270,6 +1270,53 @@ ROLLBACK TO p1;
 DROP TABLE mv;
 DROP VIEW v;
 
+-- with cross join
+\set tl 'r,s,t,u'
+SELECT pgivm.create_immv('mv(r, s, t, u)',
+ 'SELECT r.i, s.i, t.j, u.j
+    FROM (base_r r LEFT JOIN
+	       (base_s s CROSS JOIN (base_t t FULL JOIN base_u u ON ((t.j = u.j))))
+		 ON ((r.i = s.i)))');
+CREATE VIEW v(r, s, t, u) AS
+ SELECT r.i, s.i, t.j, u.j
+    FROM (base_r r LEFT JOIN
+	       (base_s s CROSS JOIN (base_t t FULL JOIN base_u u ON ((t.j = u.j))))
+		 ON ((r.i = s.i)));
+SAVEPOINT p1;
+TRUNCATE base_r;
+TRUNCATE base_s;
+TRUNCATE base_t;
+TRUNCATE base_u;
+INSERT INTO base_r VALUES (100);
+INSERT INTO base_s VALUES (100);
+INSERT INTO base_t VALUES (1);
+SELECT is_match(:'tl');
+ROLLBACK TO p1;
+DROP TABLE mv;
+DROP VIEW v;
+
+-- with null on join key columns
+\set tl 'ri,si,sj,tj'
+SELECT pgivm.create_immv('mv(ri, si, sj, tj)',
+ 'SELECT r.i, s.i, s.j, t.j
+    FROM base_r r FULL JOIN base_s s ON r.i = s.i
+	FULL JOIN base_t t ON s.j = t.j');
+CREATE VIEW v(ri, si, sj, tj) AS
+ SELECT r.i, s.i, s.j, t.j
+    FROM base_r r FULL JOIN base_s s ON r.i = s.i
+	FULL JOIN base_t t ON s.j = t.j;
+INSERT INTO base_s VALUES (1, null),(null, 2);
+SELECT is_match(:'tl');
+DELETE FROM base_s WHERE j IS NULL;
+SELECT is_match(:'tl');
+DELETE FROM base_t WHERE j = 2;
+SELECT is_match(:'tl');
+INSERT INTO base_t VALUES(2);
+SELECT is_match(:'tl');
+ROLLBACK TO p1;
+DROP TABLE mv;
+DROP VIEW v;
+
 -- support simultaneous table changes on outer join
 \set tl 'r, s'
 SELECT pgivm.create_immv('mv(r, s)',
