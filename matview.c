@@ -4831,18 +4831,11 @@ clean_up_IVM_hash_entry(MV_TriggerHashEntry *entry, bool is_abort,
 			remove_entry = true;
 		else
 		{
-			foreach(lc, entry->subxids)
-			{
-				/* Note:
-				 * PG16 or later has lfirst_xid, but we use lfirst_int for
-				 * supporting older PGs since there is no problem or now.
-				 */
-				if (lfirst_int(lc) == subxid)
-				{
-					entry->subxids = list_delete_cell(entry->subxids, lc);
-					break;
-				}
-			}
+			/* Note:
+			 * PG16 or later has list_delete_oid, but we use list_delete_int
+			 * for supporting older PGs since there is no problem or now.
+			 */
+			entry->subxids = list_delete_int(entry->subxids, subxid);
 
 			/*
 			 * If all the subxid are removed, it means that the view was not
