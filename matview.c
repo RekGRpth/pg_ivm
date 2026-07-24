@@ -20,7 +20,14 @@
 #include "catalog/heap.h"
 #include "catalog/pg_collation_d.h"
 #include "catalog/pg_trigger.h"
+#if defined(PG_VERSION_NUM) && (PG_VERSION_NUM >= 190000)
+#include "commands/repack.h"	/* commands/cluster.h was renamed to
+								 * commands/repack.h when CLUSTER/VACUUM
+								 * FULL were merged into the new REPACK
+								 * command */
+#else
 #include "commands/cluster.h"
+#endif
 #include "commands/defrem.h"
 #include "commands/matview.h"
 #include "commands/tablecmds.h"
@@ -645,7 +652,11 @@ refresh_immv_datafill(DestReceiver *dest, Query *query,
 	CHECK_FOR_INTERRUPTS();
 
 	/* Plan the query which will generate data for the refresh. */
-	plan = pg_plan_query(query, queryString, CURSOR_OPT_PARALLEL_OK, NULL);
+	plan = pg_plan_query(query, queryString, CURSOR_OPT_PARALLEL_OK, NULL
+#if defined(PG_VERSION_NUM) && (PG_VERSION_NUM >= 190000)
+						 , NULL		/* es; not under EXPLAIN */
+#endif
+						 );
 
 	/*
 	 * Use a snapshot with an updated command ID to ensure this query sees
@@ -696,6 +707,9 @@ static void
 refresh_by_heap_swap(Oid matviewOid, Oid OIDNewHeap, char relpersistence)
 {
 	finish_heap_swap(matviewOid, OIDNewHeap, false, false, true, true,
+#if defined(PG_VERSION_NUM) && (PG_VERSION_NUM >= 190000)
+					 true,		/* reindex */
+#endif
 					 RecentXmin, ReadNextMultiXactId(), relpersistence);
 }
 
@@ -4951,6 +4965,15 @@ getLastUpdateXid(Oid immv_oid)
 
 	if (!isnull)
 		xid = DatumGetFullTransactionId(datum);
+
+	/*
+	 * Only one tuple should match because of the primary key. Calling
+	 * systable_getnext() once more to confirm that no additional tuples are
+	 * visible triggers an RW-conflict check under SERIALIZABLE, improving the
+	 * stability of the isolation test.
+	 */
+	tup = systable_getnext(scan);
+	Assert(!HeapTupleIsValid(tup));
 
 	systable_endscan(scan);
 	table_close(pgIvmImmv, NoLock);
