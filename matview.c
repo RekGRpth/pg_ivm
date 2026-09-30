@@ -828,35 +828,22 @@ IVM_immediate_before(PG_FUNCTION_ARGS)
 		FullTransactionId xid;
 
 		/*
-		 * Wait for concurrent transactions which update this materialized view at
-		 * READ COMMITED. This is needed to see changes committed in other
-		 * transactions. No wait and raise an error at REPEATABLE READ or
-		 * SERIALIZABLE to prevent update anomalies of matviews.
+		 * Wait for concurrent transactions which update this materialized view.
+		 * This is needed to see changes committed in other transactions at
+		 * READ COMMITTED. At REPEATABLE READ or SERIALIZABLE, concurrent
+		 * maintenance of the view while waiting for the lock could cause an
+		 * anomaly, but it would be detected after the lock is acquired.
+		 *
 		 * XXX: dead-lock is possible here.
 		 */
-		if (!IsolationUsesXactSnapshot())
-			LockRelationOid(matviewOid, ExclusiveLock);
-		else if (!ConditionalLockRelationOid(matviewOid, ExclusiveLock))
-		{
-			/* try to throw error by name; relation could be deleted... */
-			char	   *relname = get_rel_name(matviewOid);
 
-			if (!relname)
-				ereport(ERROR,
-						(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
-						errmsg("could not obtain lock on materialized view during incremental maintenance")));
-
-			ereport(ERROR,
-					(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
-					errmsg("could not obtain lock on materialized view \"%s\" during incremental maintenance",
-							relname)));
-		}
+		LockRelationOid(matviewOid, ExclusiveLock);
 
 		/*
 		 * Even if we can acquire an lock, a concurrent transaction could have
-		 * updated the view incrementally and been committed before we acquired
+		 * updated the view incrementally and committed before we acquired
 		 * the lock. Therefore, we have to check the transaction ID of the most
-		 * recent update of the view, and if this was in progress at the
+		 * recent update of the view, and if it was in progress at the
 		 * transaction start, raise an error to prevent anomalies.
 		 */
 		xid = getLastUpdateXid(matviewOid);
